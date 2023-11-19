@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"net/url"
 	"os"
-	"runtime"
 	"testing"
 
 	"github.com/amacneil/dbmate/v2/pkg/dbmate"
@@ -51,59 +50,17 @@ func TestGetDriver(t *testing.T) {
 	require.Equal(t, "schema_migrations", drv.migrationsTableName)
 }
 
-func defaultConnString() string {
-	switch runtime.GOOS {
-	case "linux":
-		return "postgres://:5432/foo?host=%2Fvar%2Frun%2Fpostgresql"
-	case "darwin", "freebsd", "dragonfly", "openbsd", "netbsd":
-		return "postgres://:5432/foo?host=%2Ftmp"
-	default:
-		return "postgres://localhost:5432/foo"
-	}
-}
-
-func TestConnectionString(t *testing.T) {
-	cases := []struct {
-		input    string
-		expected string
-	}{
-		// defaults
-		{"postgres:///foo", defaultConnString()},
-		// support custom url params
-		{"postgres://bob:secret@myhost:1234/foo?bar=baz", "postgres://bob:secret@myhost:1234/foo?bar=baz"},
-		// support `host` and `port` via url params
-		{"postgres://bob:secret@myhost:1234/foo?host=new&port=9999", "postgres://bob:secret@:9999/foo?host=new"},
-		{"postgres://bob:secret@myhost:1234/foo?port=9999&bar=baz", "postgres://bob:secret@myhost:9999/foo?bar=baz"},
-		// support unix sockets via `host` or `socket` param
-		{"postgres://bob:secret@myhost:1234/foo?host=/var/run/postgresql", "postgres://bob:secret@:1234/foo?host=%2Fvar%2Frun%2Fpostgresql"},
-		{"postgres://bob:secret@localhost/foo?socket=/var/run/postgresql", "postgres://bob:secret@:5432/foo?host=%2Fvar%2Frun%2Fpostgresql"},
-		{"postgres:///foo?socket=/var/run/postgresql", "postgres://:5432/foo?host=%2Fvar%2Frun%2Fpostgresql"},
-		{"postgres://bob:secret@/foo?socket=/var/run/postgresql", "postgres://bob:secret@:5432/foo?host=%2Fvar%2Frun%2Fpostgresql"},
-		{"postgres://bob:secret@/foo?host=/var/run/postgresql", "postgres://bob:secret@:5432/foo?host=%2Fvar%2Frun%2Fpostgresql"},
-	}
-
-	for _, c := range cases {
-		t.Run(c.input, func(t *testing.T) {
-			u, err := url.Parse(c.input)
-			require.NoError(t, err)
-
-			actual := connectionString(u)
-			require.Equal(t, c.expected, actual)
-		})
-	}
-}
-
 func TestConnectionArgsForDump(t *testing.T) {
 	cases := []struct {
 		input    string
 		expected []string
 	}{
 		// defaults
-		{"postgres:///foo", []string{defaultConnString()}},
+		{"postgres:///foo", []string{"postgres:///foo"}},
 		// support single schema
-		{"postgres:///foo?search_path=foo", []string{"--schema", "foo", defaultConnString()}},
+		{"postgres:///foo?search_path=foo", []string{"--schema", "foo", "postgres:///foo"}},
 		// support multiple schemas
-		{"postgres:///foo?search_path=foo,public", []string{"--schema", "foo", "--schema", "public", defaultConnString()}},
+		{"postgres:///foo?search_path=foo,public", []string{"--schema", "foo", "--schema", "public", "postgres:///foo"}},
 	}
 
 	for _, c := range cases {

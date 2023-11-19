@@ -3,10 +3,11 @@ package postgres
 import (
 	"bytes"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
-	"runtime"
+	"os"
 	"strconv"
 	"strings"
 
@@ -25,6 +26,7 @@ func init() {
 type Driver struct {
 	migrationsTableName string
 	databaseURL         *url.URL
+	databaseName        string
 	log                 io.Writer
 }
 
@@ -33,57 +35,31 @@ func NewDriver(config dbmate.DriverConfig) dbmate.Driver {
 	return &Driver{
 		migrationsTableName: config.MigrationsTableName,
 		databaseURL:         config.DatabaseURL,
+		databaseName:        resolveDatabaseName(config.DatabaseURL),
 		log:                 config.Log,
 	}
 }
 
-func connectionString(u *url.URL) string {
-	hostname := u.Hostname()
-	port := u.Port()
-	query := u.Query()
+func resolveDatabaseName(u *url.URL) (name string) {
+	// https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-DBNAME
 
-	// support socket parameter for consistency with mysql
-	if query.Get("socket") != "" {
-		query.Set("host", query.Get("socket"))
-		query.Del("socket")
+	if name = u.Path; len(name) > 0 && name[:1] == "/" {
+		name = name[1:]
+	}
+	if name == "" {
+		// if there's no path in the URL, but there's an environment variable so use it
+		name = os.Getenv("PGDATABASE")
+	}
+	if name == "" && u.User != nil {
+		// if there's no path and no environment variable, fallback to the user's name (if any)
+		name = u.User.Username()
 	}
 
-	// default hostname
-	if hostname == "" && query.Get("host") == "" {
-		switch runtime.GOOS {
-		case "linux":
-			query.Set("host", "/var/run/postgresql")
-		case "darwin", "freebsd", "dragonfly", "openbsd", "netbsd":
-			query.Set("host", "/tmp")
-		default:
-			hostname = "localhost"
-		}
-	}
-
-	// host param overrides url hostname
-	if query.Get("host") != "" {
-		hostname = ""
-	}
-
-	// always specify a port
-	if query.Get("port") != "" {
-		port = query.Get("port")
-		query.Del("port")
-	}
-	if port == "" {
-		port = "5432"
-	}
-
-	// generate output URL
-	out, _ := url.Parse(u.String())
-	out.Host = fmt.Sprintf("%s:%s", hostname, port)
-	out.RawQuery = query.Encode()
-
-	return out.String()
+	return
 }
 
-func connectionArgsForDump(u *url.URL) []string {
-	u = dbutil.MustParseURL(connectionString(u))
+func connectionArgsForDump(u *url.URL) (args []string) {
+	u = dbutil.MustParseURL(u.String()) // clone the URL
 
 	// find schemas from search_path
 	query := u.Query()
@@ -91,68 +67,56 @@ func connectionArgsForDump(u *url.URL) []string {
 	query.Del("search_path")
 	u.RawQuery = query.Encode()
 
-	out := []string{}
 	for _, schema := range schemas {
-		schema = strings.TrimSpace(schema)
-		if schema != "" {
-			out = append(out, "--schema", schema)
+		if schema = strings.TrimSpace(schema); schema != "" {
+			args = append(args, "--schema", schema)
 		}
 	}
-	out = append(out, u.String())
+	args = append(args, u.String())
 
-	return out
+	return args
 }
 
 // Open creates a new database connection
 func (drv *Driver) Open() (*sql.DB, error) {
-	return sql.Open("postgres", connectionString(drv.databaseURL))
+	return sql.Open("postgres", drv.databaseURL.String())
 }
 
-func (drv *Driver) openPostgresDB() (*sql.DB, error) {
-	// clone databaseURL
-	postgresURL, err := url.Parse(connectionString(drv.databaseURL))
-	if err != nil {
-		return nil, err
-	}
+func (drv *Driver) openMaintenanceDB() (*sql.DB, error) {
+	u := dbutil.MustParseURL(drv.databaseURL.String()) // clone the URL
 
-	// connect to postgres database
-	postgresURL.Path = "postgres"
+	// connect to the maintenance database (default: "postgres")
+	u.Path = "postgres"
 
-	return sql.Open("postgres", postgresURL.String())
+	return sql.Open("postgres", u.String())
 }
 
 // CreateDatabase creates the specified database
-func (drv *Driver) CreateDatabase() error {
-	name := dbutil.DatabaseName(drv.databaseURL)
-	fmt.Fprintf(drv.log, "Creating: %s\n", name)
+func (drv *Driver) CreateDatabase() (err error) {
+	fmt.Fprintf(drv.log, "Creating: %s\n", drv.databaseName)
 
-	db, err := drv.openPostgresDB()
-	if err != nil {
-		return err
+	var db *sql.DB
+	if db, err = drv.openMaintenanceDB(); err == nil {
+		defer dbutil.MustClose(db)
+
+		_, err = db.Exec(fmt.Sprintf("create database %s;", pq.QuoteIdentifier(drv.databaseName)))
 	}
-	defer dbutil.MustClose(db)
 
-	_, err = db.Exec(fmt.Sprintf("create database %s",
-		pq.QuoteIdentifier(name)))
-
-	return err
+	return
 }
 
 // DropDatabase drops the specified database (if it exists)
-func (drv *Driver) DropDatabase() error {
-	name := dbutil.DatabaseName(drv.databaseURL)
-	fmt.Fprintf(drv.log, "Dropping: %s\n", name)
+func (drv *Driver) DropDatabase() (err error) {
+	fmt.Fprintf(drv.log, "Dropping: %s\n", drv.databaseName)
 
-	db, err := drv.openPostgresDB()
-	if err != nil {
-		return err
+	var db *sql.DB
+	if db, err = drv.openMaintenanceDB(); err == nil {
+		defer dbutil.MustClose(db)
+
+		_, err = db.Exec(fmt.Sprintf("drop database if exists %s;", pq.QuoteIdentifier(drv.databaseName)))
 	}
-	defer dbutil.MustClose(db)
 
-	_, err = db.Exec(fmt.Sprintf("drop database if exists %s",
-		pq.QuoteIdentifier(name)))
-
-	return err
+	return
 }
 
 func (drv *Driver) schemaMigrationsDump(db *sql.DB) ([]byte, error) {
@@ -183,9 +147,14 @@ func (drv *Driver) schemaMigrationsDump(db *sql.DB) ([]byte, error) {
 
 // DumpSchema returns the current database schema
 func (drv *Driver) DumpSchema(db *sql.DB) ([]byte, error) {
-	// load schema
-	args := append([]string{"--format=plain", "--encoding=UTF8", "--schema-only",
-		"--no-privileges", "--no-owner"}, connectionArgsForDump(drv.databaseURL)...)
+	args := append([]string{
+		"--format=plain",
+		"--encoding=UTF8",
+		"--schema-only",
+		"--no-privileges",
+		"--no-owner",
+	}, connectionArgsForDump(drv.databaseURL)...)
+
 	schema, err := dbutil.RunCommand("pg_dump", args...)
 	if err != nil {
 		return nil, err
@@ -202,22 +171,16 @@ func (drv *Driver) DumpSchema(db *sql.DB) ([]byte, error) {
 
 // DatabaseExists determines whether the database exists
 func (drv *Driver) DatabaseExists() (bool, error) {
-	name := dbutil.DatabaseName(drv.databaseURL)
-
-	db, err := drv.openPostgresDB()
-	if err != nil {
-		return false, err
+	err := drv.ping()
+	if err == nil {
+		return true, nil
 	}
-	defer dbutil.MustClose(db)
 
-	exists := false
-	err = db.QueryRow("select true from pg_database where datname = $1", name).
-		Scan(&exists)
-	if err == sql.ErrNoRows {
+	var pqerr *pq.Error
+	if errors.As(err, &pqerr) && pqerr.Code == "3D000" {
 		return false, nil
 	}
-
-	return exists, err
+	return false, err
 }
 
 // MigrationsTableExists checks if the schema_migrations table exists
@@ -340,28 +303,23 @@ func (drv *Driver) DeleteMigration(db dbutil.Transaction, version string) error 
 
 // Ping verifies a connection to the database server. It does not verify whether the
 // specified database exists.
-func (drv *Driver) Ping() error {
-	// attempt connection to primary database, not "postgres" database
-	// to support servers with no "postgres" database
-	// (see https://github.com/amacneil/dbmate/issues/78)
-	db, err := drv.Open()
-	if err != nil {
-		return err
-	}
-	defer dbutil.MustClose(db)
-
-	err = db.Ping()
-	if err == nil {
-		return nil
+func (drv *Driver) Ping() (err error) {
+	var pqerr *pq.Error
+	if errors.As(drv.ping(), &pqerr) && pqerr.Code == "3D000" {
+		err = nil // ignore 'database does not exist' error
 	}
 
-	// ignore 'database does not exist' error
-	pqErr, ok := err.(*pq.Error)
-	if ok && pqErr.Code == "3D000" {
-		return nil
-	}
+	return
+}
 
-	return err
+func (drv *Driver) ping() (err error) {
+	var db *sql.DB
+	if db, err = drv.Open(); err == nil {
+		defer dbutil.MustClose(db)
+
+		err = db.Ping()
+	}
+	return
 }
 
 // Return a normalized version of the driver-specific error type.
